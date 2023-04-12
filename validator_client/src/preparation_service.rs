@@ -1,9 +1,10 @@
 use crate::beacon_node_fallback::{BeaconNodeFallback, RequireSynced};
 use crate::validator_store::{DoppelgangerStatus, ValidatorStore};
+use crate::OfflineOnFailure;
 use bls::PublicKeyBytes;
 use environment::RuntimeContext;
 use parking_lot::RwLock;
-use slog::{debug, error, info};
+use slog::{debug, error, info, warn};
 use slot_clock::SlotClock;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -293,7 +294,7 @@ impl<T: SlotClock + 'static, E: EthSpec> PreparationService<T, E> {
             proposal_data.fee_recipient.and_then(|fee_recipient| {
                 proposal_data
                     .builder_proposals
-                    .then(|| ValidatorRegistrationKey {
+                    .then_some(ValidatorRegistrationKey {
                         fee_recipient,
                         gas_limit: proposal_data.gas_limit,
                         pubkey,
@@ -330,11 +331,15 @@ impl<T: SlotClock + 'static, E: EthSpec> PreparationService<T, E> {
         let preparation_entries = preparation_data.as_slice();
         match self
             .beacon_nodes
-            .first_success(RequireSynced::Yes, |beacon_node| async move {
-                beacon_node
-                    .post_validator_prepare_beacon_proposer(preparation_entries)
-                    .await
-            })
+            .run(
+                RequireSynced::Yes,
+                OfflineOnFailure::Yes,
+                |beacon_node| async move {
+                    beacon_node
+                        .post_validator_prepare_beacon_proposer(preparation_entries)
+                        .await
+                },
+            )
             .await
         {
             Ok(()) => debug!(
@@ -344,7 +349,7 @@ impl<T: SlotClock + 'static, E: EthSpec> PreparationService<T, E> {
             ),
             Err(e) => error!(
                 log,
-                "Unable to publish proposer preparation";
+                "Unable to publish proposer preparation to all beacon nodes";
                 "error" => %e,
             ),
         }
@@ -445,9 +450,13 @@ impl<T: SlotClock + 'static, E: EthSpec> PreparationService<T, E> {
             for batch in signed.chunks(VALIDATOR_REGISTRATION_BATCH_SIZE) {
                 match self
                     .beacon_nodes
-                    .first_success(RequireSynced::Yes, |beacon_node| async move {
-                        beacon_node.post_validator_register_validator(batch).await
-                    })
+                    .first_success(
+                        RequireSynced::Yes,
+                        OfflineOnFailure::No,
+                        |beacon_node| async move {
+                            beacon_node.post_validator_register_validator(batch).await
+                        },
+                    )
                     .await
                 {
                     Ok(()) => info!(
@@ -455,7 +464,7 @@ impl<T: SlotClock + 'static, E: EthSpec> PreparationService<T, E> {
                         "Published validator registrations to the builder network";
                         "count" => registration_data_len,
                     ),
-                    Err(e) => error!(
+                    Err(e) => warn!(
                         log,
                         "Unable to publish validator registrations to the builder network";
                         "error" => %e,

@@ -1,24 +1,35 @@
 use beacon_chain::{
-    test_utils::{BeaconChainHarness, EphemeralHarnessType},
+    test_utils::{
+        BeaconChainHarness, BoxedMutator, Builder as HarnessBuilder, EphemeralHarnessType,
+    },
     BeaconChain, BeaconChainTypes,
 };
+use directory::DEFAULT_ROOT_DIR;
 use eth2::{BeaconNodeHttpClient, Timeouts};
 use http_api::{Config, Context};
 use lighthouse_network::{
     discv5::enr::{CombinedKey, EnrBuilder},
-    libp2p::{core::connection::ConnectionId, swarm::NetworkBehaviour},
+    libp2p::{
+        core::connection::ConnectionId,
+        swarm::{
+            behaviour::{ConnectionEstablished, FromSwarm},
+            NetworkBehaviour,
+        },
+    },
     rpc::methods::{MetaData, MetaDataV2},
     types::{EnrAttestationBitfield, EnrSyncCommitteeBitfield, SyncState},
     ConnectedPoint, Enr, NetworkGlobals, PeerId, PeerManager,
 };
-use network::NetworkMessage;
+use logging::test_logger;
+use network::{NetworkReceivers, NetworkSenders};
 use sensitive_url::SensitiveUrl;
 use slog::Logger;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use store::MemoryStore;
+use tokio::sync::oneshot;
 use types::{ChainSpec, EthSpec};
 
 pub const TCP_PORT: u16 = 42;
@@ -30,7 +41,7 @@ pub const EXTERNAL_ADDR: &str = "/ip4/0.0.0.0/tcp/9000";
 pub struct InteractiveTester<E: EthSpec> {
     pub harness: BeaconChainHarness<EphemeralHarnessType<E>>,
     pub client: BeaconNodeHttpClient,
-    pub network_rx: mpsc::UnboundedReceiver<NetworkMessage<E>>,
+    pub network_rx: NetworkReceivers<E>,
     _server_shutdown: oneshot::Sender<()>,
 }
 
@@ -41,18 +52,49 @@ pub struct ApiServer<E: EthSpec, SFut: Future<Output = ()>> {
     pub server: SFut,
     pub listening_socket: SocketAddr,
     pub shutdown_tx: oneshot::Sender<()>,
-    pub network_rx: tokio::sync::mpsc::UnboundedReceiver<NetworkMessage<E>>,
+    pub network_rx: NetworkReceivers<E>,
     pub local_enr: Enr,
     pub external_peer_id: PeerId,
 }
 
+type Initializer<E> = Box<
+    dyn FnOnce(HarnessBuilder<EphemeralHarnessType<E>>) -> HarnessBuilder<EphemeralHarnessType<E>>,
+>;
+type Mutator<E> = BoxedMutator<E, MemoryStore<E>, MemoryStore<E>>;
+
 impl<E: EthSpec> InteractiveTester<E> {
     pub async fn new(spec: Option<ChainSpec>, validator_count: usize) -> Self {
-        let harness = BeaconChainHarness::builder(E::default())
+        Self::new_with_initializer_and_mutator(spec, validator_count, None, None).await
+    }
+
+    pub async fn new_with_initializer_and_mutator(
+        spec: Option<ChainSpec>,
+        validator_count: usize,
+        initializer: Option<Initializer<E>>,
+        mutator: Option<Mutator<E>>,
+    ) -> Self {
+        let mut harness_builder = BeaconChainHarness::builder(E::default())
             .spec_or_default(spec)
-            .deterministic_keypairs(validator_count)
-            .fresh_ephemeral_store()
-            .build();
+            .logger(test_logger())
+            .mock_execution_layer();
+
+        harness_builder = if let Some(initializer) = initializer {
+            // Apply custom initialization provided by the caller.
+            initializer(harness_builder)
+        } else {
+            // Apply default initial configuration.
+            harness_builder
+                .deterministic_keypairs(validator_count)
+                .fresh_ephemeral_store()
+        };
+
+        // Add a mutator for the beacon chain builder which will be called in
+        // `HarnessBuilder::build`.
+        if let Some(mutator) = mutator {
+            harness_builder = harness_builder.initial_mutator(mutator);
+        }
+
+        let harness = harness_builder.build();
 
         let ApiServer {
             server,
@@ -88,7 +130,7 @@ pub async fn create_api_server<T: BeaconChainTypes>(
     log: Logger,
 ) -> ApiServer<T::EthSpec, impl Future<Output = ()>> {
     // Get a random unused port.
-    let port = unused_port::unused_tcp_port().unwrap();
+    let port = unused_port::unused_tcp4_port().unwrap();
     create_api_server_on_port(chain, log, port).await
 }
 
@@ -97,7 +139,7 @@ pub async fn create_api_server_on_port<T: BeaconChainTypes>(
     log: Logger,
     port: u16,
 ) -> ApiServer<T::EthSpec, impl Future<Output = ()>> {
-    let (network_tx, network_rx) = mpsc::unbounded_channel();
+    let (network_senders, network_receivers) = NetworkSenders::new();
 
     // Default metadata
     let meta_data = MetaData::V2(MetaDataV2 {
@@ -109,8 +151,8 @@ pub async fn create_api_server_on_port<T: BeaconChainTypes>(
     let enr = EnrBuilder::new("v4").build(&enr_key).unwrap();
     let network_globals = Arc::new(NetworkGlobals::new(
         enr.clone(),
-        TCP_PORT,
-        UDP_PORT,
+        Some(TCP_PORT),
+        None,
         meta_data,
         vec![],
         &log,
@@ -118,22 +160,27 @@ pub async fn create_api_server_on_port<T: BeaconChainTypes>(
 
     // Only a peer manager can add peers, so we create a dummy manager.
     let config = lighthouse_network::peer_manager::config::Config::default();
-    let mut pm = PeerManager::new(config, network_globals.clone(), &log)
-        .await
-        .unwrap();
+    let mut pm = PeerManager::new(config, network_globals.clone(), &log).unwrap();
 
     // add a peer
     let peer_id = PeerId::random();
 
-    let connected_point = ConnectedPoint::Listener {
+    let endpoint = &ConnectedPoint::Listener {
         local_addr: EXTERNAL_ADDR.parse().unwrap(),
         send_back_addr: EXTERNAL_ADDR.parse().unwrap(),
     };
-    let con_id = ConnectionId::new(1);
-    pm.inject_connection_established(&peer_id, &con_id, &connected_point, None, 0);
+    let connection_id = ConnectionId::new(1);
+    pm.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+        peer_id,
+        connection_id,
+        endpoint,
+        failed_addresses: &[],
+        other_established: 0,
+    }));
     *network_globals.sync_state.write() = SyncState::Synced;
 
-    let eth1_service = eth1::Service::new(eth1::Config::default(), log.clone(), chain.spec.clone());
+    let eth1_service =
+        eth1::Service::new(eth1::Config::default(), log.clone(), chain.spec.clone()).unwrap();
 
     let context = Arc::new(Context {
         config: Config {
@@ -143,10 +190,11 @@ pub async fn create_api_server_on_port<T: BeaconChainTypes>(
             allow_origin: None,
             tls_config: None,
             allow_sync_stalled: false,
+            data_dir: std::path::PathBuf::from(DEFAULT_ROOT_DIR),
             spec_fork_name: None,
         },
         chain: Some(chain.clone()),
-        network_tx: Some(network_tx),
+        network_senders: Some(network_senders),
         network_globals: Some(network_globals),
         eth1_service: Some(eth1_service),
         log,
@@ -163,7 +211,7 @@ pub async fn create_api_server_on_port<T: BeaconChainTypes>(
         server,
         listening_socket,
         shutdown_tx,
-        network_rx,
+        network_rx: network_receivers,
         local_enr: enr,
         external_peer_id: peer_id,
     }

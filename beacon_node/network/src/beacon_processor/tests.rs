@@ -36,7 +36,6 @@ const SMALL_CHAIN: u64 = 2;
 const LONG_CHAIN: u64 = SLOTS_PER_EPOCH * 2;
 
 const TCP_PORT: u16 = 42;
-const UDP_PORT: u16 = 42;
 const SEQ_NUMBER: u64 = 0;
 
 /// The default time to wait for `BeaconProcessor` events.
@@ -177,8 +176,8 @@ impl TestRig {
         let enr = EnrBuilder::new("v4").build(&enr_key).unwrap();
         let network_globals = Arc::new(NetworkGlobals::new(
             enr,
-            TCP_PORT,
-            UDP_PORT,
+            Some(TCP_PORT),
+            None,
             meta_data,
             vec![],
             &log,
@@ -242,6 +241,7 @@ impl TestRig {
 
     pub fn enqueue_rpc_block(&self) {
         let event = WorkEvent::rpc_beacon_block(
+            self.next_block.canonical_root(),
             self.next_block.clone(),
             std::time::Duration::default(),
             BlockProcessType::ParentLookup {
@@ -253,6 +253,7 @@ impl TestRig {
 
     pub fn enqueue_single_lookup_rpc_block(&self) {
         let event = WorkEvent::rpc_beacon_block(
+            self.next_block.canonical_root(),
             self.next_block.clone(),
             std::time::Duration::default(),
             BlockProcessType::SingleBlock { id: 1 },

@@ -1,5 +1,6 @@
 use crate::metrics;
 use beacon_chain::{
+    capella_readiness::CapellaReadiness,
     merge_readiness::{MergeConfig, MergeReadiness},
     BeaconChain, BeaconChainTypes, ExecutionStatus,
 };
@@ -33,20 +34,9 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
     seconds_per_slot: u64,
 ) -> Result<(), String> {
     let slot_duration = Duration::from_secs(seconds_per_slot);
-    let duration_to_next_slot = beacon_chain
-        .slot_clock
-        .duration_to_next_slot()
-        .ok_or("slot_notifier unable to determine time to next slot")?;
-
-    // Run this half way through each slot.
-    let start_instant = tokio::time::Instant::now() + duration_to_next_slot + (slot_duration / 2);
-
-    // Run this each slot.
-    let interval_duration = slot_duration;
 
     let speedo = Mutex::new(Speedo::default());
     let log = executor.log().clone();
-    let mut interval = tokio::time::interval_at(start_instant, interval_duration);
 
     // Keep track of sync state and reset the speedo on specific sync state changes.
     // Specifically, if we switch between a sync and a backfill sync, reset the speedo.
@@ -82,7 +72,20 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
         let mut last_backfill_log_slot = None;
 
         loop {
-            interval.tick().await;
+            // Run the notifier half way through each slot.
+            //
+            // Keep remeasuring the offset rather than using an interval, so that we can correct
+            // for system time clock adjustments.
+            let wait = match beacon_chain.slot_clock.duration_to_next_slot() {
+                Some(duration) => duration + slot_duration / 2,
+                None => {
+                    warn!(log, "Unable to read current slot");
+                    sleep(slot_duration).await;
+                    continue;
+                }
+            };
+            sleep(wait).await;
+
             let connected_peer_count = network.connected_peers();
             let sync_state = network.sync_state();
 
@@ -311,6 +314,7 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
 
             eth1_logging(&beacon_chain, &log);
             merge_readiness_logging(current_slot, &beacon_chain, &log).await;
+            capella_readiness_logging(current_slot, &beacon_chain, &log).await;
         }
     };
 
@@ -348,12 +352,15 @@ async fn merge_readiness_logging<T: BeaconChainTypes>(
     }
 
     if merge_completed && !has_execution_layer {
-        error!(
-            log,
-            "Execution endpoint required";
-            "info" => "you need an execution engine to validate blocks, see: \
-                       https://lighthouse-book.sigmaprime.io/merge-migration.html"
-        );
+        if !beacon_chain.is_time_to_prepare_for_capella(current_slot) {
+            // logging of the EE being offline is handled in `capella_readiness_logging()`
+            error!(
+                log,
+                "Execution endpoint required";
+                "info" => "you need an execution engine to validate blocks, see: \
+                           https://lighthouse-book.sigmaprime.io/merge-migration.html"
+            );
+        }
         return;
     }
 
@@ -412,6 +419,65 @@ async fn merge_readiness_logging<T: BeaconChainTypes>(
         readiness @ MergeReadiness::NoExecutionEndpoint => warn!(
             log,
             "Not ready for merge";
+            "info" => %readiness,
+        ),
+    }
+}
+
+/// Provides some helpful logging to users to indicate if their node is ready for Capella
+async fn capella_readiness_logging<T: BeaconChainTypes>(
+    current_slot: Slot,
+    beacon_chain: &BeaconChain<T>,
+    log: &Logger,
+) {
+    let capella_completed = beacon_chain
+        .canonical_head
+        .cached_head()
+        .snapshot
+        .beacon_block
+        .message()
+        .body()
+        .execution_payload()
+        .map_or(false, |payload| payload.withdrawals_root().is_ok());
+
+    let has_execution_layer = beacon_chain.execution_layer.is_some();
+
+    if capella_completed && has_execution_layer
+        || !beacon_chain.is_time_to_prepare_for_capella(current_slot)
+    {
+        return;
+    }
+
+    if capella_completed && !has_execution_layer {
+        error!(
+            log,
+            "Execution endpoint required";
+            "info" => "you need a Capella enabled execution engine to validate blocks, see: \
+                       https://lighthouse-book.sigmaprime.io/merge-migration.html"
+        );
+        return;
+    }
+
+    match beacon_chain.check_capella_readiness().await {
+        CapellaReadiness::Ready => {
+            info!(
+                log,
+                "Ready for Capella";
+                "info" => "ensure the execution endpoint is updated to the latest Capella/Shanghai release"
+            )
+        }
+        readiness @ CapellaReadiness::ExchangeCapabilitiesFailed { error: _ } => {
+            error!(
+                log,
+                "Not ready for Capella";
+                "hint" => "the execution endpoint may be offline",
+                "info" => %readiness,
+            )
+        }
+        readiness => warn!(
+            log,
+            "Not ready for Capella";
+            "hint" => "try updating the execution endpoint",
             "info" => %readiness,
         ),
     }

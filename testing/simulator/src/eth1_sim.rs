@@ -1,4 +1,4 @@
-use crate::local_network::{EXECUTION_PORT, INVALID_ADDRESS, TERMINAL_BLOCK, TERMINAL_DIFFICULTY};
+use crate::local_network::{EXECUTION_PORT, TERMINAL_BLOCK, TERMINAL_DIFFICULTY};
 use crate::{checks, LocalNetwork, E};
 use clap::ArgMatches;
 use eth1::{Eth1Endpoint, DEFAULT_CHAIN_ID};
@@ -13,7 +13,7 @@ use node_test_rig::{
 use rayon::prelude::*;
 use sensitive_url::SensitiveUrl;
 use std::cmp::max;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 use tokio::time::sleep;
 use types::{Epoch, EthSpec, MinimalEthSpec};
@@ -56,18 +56,19 @@ pub fn run_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
         })
         .collect::<Vec<_>>();
 
-    let log_level = "debug";
-    let log_format = None;
-
     let mut env = EnvironmentBuilder::minimal()
         .initialize_logger(LoggerConfig {
             path: None,
-            debug_level: log_level,
-            logfile_debug_level: "debug",
-            log_format,
+            debug_level: String::from("debug"),
+            logfile_debug_level: String::from("debug"),
+            log_format: None,
+            logfile_format: None,
+            log_color: false,
+            disable_log_timestamp: false,
             max_log_size: 0,
             max_log_number: 0,
             compression: false,
+            is_restricted: true,
         })?
         .multi_threaded_tokio_runtime()?
         .build()?;
@@ -136,7 +137,7 @@ pub fn run_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
         let mut beacon_config = testing_client_config();
 
         beacon_config.genesis = ClientGenesis::DepositContract;
-        beacon_config.eth1.endpoints = Eth1Endpoint::NoAuth(vec![eth1_endpoint]);
+        beacon_config.eth1.endpoint = Eth1Endpoint::NoAuth(eth1_endpoint);
         beacon_config.eth1.deposit_contract_address = deposit_contract_address;
         beacon_config.eth1.deposit_contract_deploy_block = 0;
         beacon_config.eth1.lowest_cached_block_number = 0;
@@ -148,7 +149,7 @@ pub fn run_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
         beacon_config.eth1.chain_id = Eth1Id::from(chain_id);
         beacon_config.network.target_peers = node_count - 1;
 
-        beacon_config.network.enr_address = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        beacon_config.network.enr_address = (Some(Ipv4Addr::LOCALHOST), None);
 
         if post_merge_sim {
             let el_config = execution_layer::Config {
@@ -171,18 +172,8 @@ pub fn run_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
         /*
          * One by one, add beacon nodes to the network.
          */
-        for i in 0..node_count - 1 {
-            let mut config = beacon_config.clone();
-            if i % 2 == 0 {
-                if let Eth1Endpoint::NoAuth(endpoints) = &mut config.eth1.endpoints {
-                    endpoints.insert(
-                        0,
-                        SensitiveUrl::parse(INVALID_ADDRESS)
-                            .expect("Unable to parse invalid address"),
-                    )
-                }
-            }
-            network.add_beacon_node(config).await?;
+        for _ in 0..node_count - 1 {
+            network.add_beacon_node(beacon_config.clone()).await?;
         }
 
         /*

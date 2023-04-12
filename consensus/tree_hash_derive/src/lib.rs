@@ -1,4 +1,3 @@
-#![recursion_limit = "256"]
 use darling::FromDeriveInput;
 use proc_macro::TokenStream;
 use quote::quote;
@@ -150,7 +149,7 @@ fn tree_hash_derive_struct(item: &DeriveInput, struct_data: &DataStruct) -> Toke
                 tree_hash::TreeHashType::Container
             }
 
-            fn tree_hash_packed_encoding(&self) -> Vec<u8> {
+            fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
                 unreachable!("Struct should never be packed.")
             }
 
@@ -231,7 +230,7 @@ fn tree_hash_derive_enum_transparent(
                 tree_hash::TreeHashType::Container
             }
 
-            fn tree_hash_packed_encoding(&self) -> Vec<u8> {
+            fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
                 unreachable!("Enum should never be packed")
             }
 
@@ -288,7 +287,7 @@ fn tree_hash_derive_enum_union(derive_input: &DeriveInput, enum_data: &DataEnum)
                 tree_hash::TreeHashType::Container
             }
 
-            fn tree_hash_packed_encoding(&self) -> Vec<u8> {
+            fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
                 unreachable!("Enum should never be packed")
             }
 

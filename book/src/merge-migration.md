@@ -1,8 +1,8 @@
 # Merge Migration
 
-This document provides detail for users who want to run a merge-ready Lighthouse node.
+This document provides detail for users who want to run a Lighthouse node on post-merge Ethereum.
 
-> If you are running a testnet node, this configuration is necessary _now_.
+> The merge occurred on mainnet in September 2022.
 
 ## Necessary Configuration
 
@@ -10,27 +10,25 @@ There are two configuration changes required for a Lighthouse node to operate co
 the merge:
 
 1. You *must* run your own execution engine such as Geth or Nethermind alongside Lighthouse.
-   You *must* update your Lighthouse configuration to connect to the execution engine using new
+   You *must* update your `lighthouse bn` configuration to connect to the execution engine using new
    flags which are documented on this page in the
    [Connecting to an execution engine](#connecting-to-an-execution-engine) section.
 2. If your Lighthouse node has validators attached you *must* nominate an Ethereum address to
-   receive transactions tips from blocks proposed by your validators. This is covered on the
+   receive transactions tips from blocks proposed by your validators. These changes should
+   be made to your `lighthouse vc` configuration, and are covered on the
    [Suggested fee recipient](./suggested-fee-recipient.md) page.
 
-Additionally, you _must_ update Lighthouse to a merge-compatible release in the weeks before
-the merge. Merge releases are available now for all testnets.
+Additionally, you _must_ update Lighthouse to v3.0.0 (or later), and must update your execution
+engine to a merge-ready version.
 
 ## When?
 
 You must configure your node to be merge-ready before the Bellatrix fork occurs on the network
 on which your node is operating.
 
-* **Mainnet**: the Bellatrix fork epoch has not yet been announced. It's possible to set up a
-  merge-ready node now, but some execution engines will require additional configuration. Please see
-  the section on [Execution engine configuration](#execution-engine-configuration) below.
-
-* **Goerli (Prater)**, **Ropsten**, **Sepolia**, **Kiln**: you must have a merge-ready configuration
-  right now.
+* **Gnosis**: the Bellatrix fork has not yet been scheduled.
+* **Mainnet**, **Goerli (Prater)**, **Ropsten**, **Sepolia**, **Kiln**: the Bellatrix fork has
+  already occurred. You must have a merge-ready configuration right now.
 
 ## Connecting to an execution engine
 
@@ -46,22 +44,30 @@ If you set up an execution engine with `--execution-endpoint` then you *must* pr
 using `--execution-jwt`. This is a mandatory form of authentication that ensures that Lighthouse
 has authority to control the execution engine.
 
+> Tip: the --execution-jwt-secret-key <STRING> flag can be used instead of --execution-jwt <FILE>.
+> This is useful, for example, for users who wish to inject the value into a Docker container without
+> needing to pass a jwt secret file.
+
+The execution engine connection must be **exclusive**, i.e. you must have one execution node
+per beacon node. The reason for this is that the beacon node _controls_ the execution node. Please
+see the [FAQ](#faq) for further information about why many:1 and 1:many configurations are not
+supported.
+
 ### Execution engine configuration
 
 Each execution engine has its own flags for configuring the engine API and JWT. Please consult
 the relevant page for your execution engine for the required flags:
 
-- [Geth: Connecting to Consensus Clients](https://geth.ethereum.org/docs/interface/consensus-clients)
+- [Geth: Connecting to Consensus Clients](https://geth.ethereum.org/docs/getting-started/consensus-clients)
 - [Nethermind: Running Nethermind Post Merge](https://docs.nethermind.io/nethermind/first-steps-with-nethermind/running-nethermind-post-merge)
 - [Besu: Prepare For The Merge](https://besu.hyperledger.org/en/stable/HowTo/Upgrade/Prepare-for-The-Merge/)
+- [Erigon: Beacon Chain (Consensus Layer)](https://github.com/ledgerwatch/erigon#beacon-chain-consensus-layer)
 
 Once you have configured your execution engine to open up the engine API (usually on port 8551) you
 should add the URL to your `lighthouse bn` flags with `--execution-endpoint <URL>`, as well as
 the path to the JWT secret with `--execution-jwt <FILE>`.
 
-> NOTE: Geth v1.10.21 or earlier requires a manual TTD override to communicate with Lighthouse over
-> the engine API on mainnet. We recommend waiting for a compatible Geth release before configuring
-> Lighthouse-Geth on mainnet.
+There are merge-ready releases of all compatible execution engines available now.
 
 ### Example
 
@@ -72,7 +78,7 @@ lighthouse \
     --network mainnet \
     beacon_node \
     --http \
-    --eth1-endpoints http://localhost:8545,https://TOKEN@eth2-beacon-mainnet.infura.io
+    --eth1-endpoints http://localhost:8545,https://mainnet.infura.io/v3/TOKEN
 ```
 
 Converting the above to a post-merge configuration would render:
@@ -138,6 +144,27 @@ be used for all such queries. Therefore we can say that where `--execution-endpo
 
 ## FAQ
 
+### How do I know if my node is set up correctly?
+
+Lighthouse will log a message indicating that it is ready for the merge:
+
+```
+INFO Ready for the merge, current_difficulty: 10789363, terminal_total_difficulty: 10790000
+```
+
+Once the merge has occurred you should see that Lighthouse remains in sync and marks blocks
+as `verified` indicating that they have been processed successfully by the execution engine:
+
+```
+INFO Synced, slot: 3690668, block: 0x1244…cb92, epoch: 115333, finalized_epoch: 115331, finalized_root: 0x0764…2a3d, exec_hash: 0x929c…1ff6 (verified), peers: 78
+```
+
+### Can I still use the `--staking` flag?
+
+Yes. The `--staking` flag is just an alias for `--http --eth1`. The `--eth1` flag is now superfluous
+so `--staking` is equivalent to `--http`. You need either `--staking` or `--http` for the validator
+client to be able to connect to the beacon node.
+
 ### Can I use `http://localhost:8545` for the execution endpoint?
 
 Most execution nodes use port `8545` for the Ethereum JSON-RPC API. Unless custom configuration is
@@ -145,9 +172,22 @@ used, an execution node _will not_ provide the necessary engine API on port `854
 not attempt to use `http://localhost:8545` as your engine URL and should instead use
 `http://localhost:8551`.
 
-### What about multiple execution endpoints?
+### Can I share an execution node between multiple beacon nodes (many:1)?
 
-Since an execution engine can only have one connected BN, the value of having multiple execution
+It is **not** possible to connect more than one beacon node to the same execution engine. There must be a 1:1 relationship between beacon nodes and execution nodes.
+
+The beacon node controls the execution node via the engine API, telling it which block is the
+current head of the chain. If multiple beacon nodes were to connect to a single execution node they
+could set conflicting head blocks, leading to frequent re-orgs on the execution node.
+
+We imagine that in future there will be HTTP proxies available which allow users to nominate a
+single controlling beacon node, while allowing consistent updates from other beacon nodes.
+
+### What about multiple execution endpoints (1:many)?
+
+It is **not** possible to connect one beacon node to more than one execution engine. There must be a 1:1 relationship between beacon nodes and execution nodes.
+
+Since an execution engine can only have one controlling BN, the value of having multiple execution
 engines connected to the same BN is very low. An execution engine cannot be shared between BNs to
 reduce costs.
 
@@ -163,5 +203,5 @@ guidance for specific setups.
 - [Ethereum.org: The Merge](https://ethereum.org/en/upgrades/merge/)
 - [Ethereum Staking Launchpad: Merge Readiness](https://launchpad.ethereum.org/en/merge-readiness).
 - [CoinCashew: Ethereum Merge Upgrade Checklist](https://www.coincashew.com/coins/overview-eth/ethereum-merge-upgrade-checklist-for-home-stakers-and-validators)
-- [EthDocker: Merge Preparation](https://eth-docker.net/docs/About/MergePrep/)
+- [EthDocker: Merge Preparation](https://eth-docker.net/About/MergePrep/)
 - [Remy Roy: How to join the Goerli/Prater merge testnet](https://github.com/remyroy/ethstaker/blob/main/merge-goerli-prater.md)
